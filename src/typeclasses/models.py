@@ -321,6 +321,7 @@ class AttributeHandler(object):
             return ret if len(key) > 1 else default
         return ret[0] if len(ret)==1 else ret
 
+
     def add(self, key, value, category=None, lockstring="",
             strattr=False, accessing_obj=None, default_access=True):
         """
@@ -341,28 +342,87 @@ class AttributeHandler(object):
             self._recache()
         if not key:
             return
-        key = key.strip().lower()
+
         category = category.strip().lower() if category is not None else None
-        cachekey = "%s-%s" % (key, category)
+        keystr = key.strip().lower()
+        cachekey = "%s-%s" % (keystr, category)
         attr_obj = self._cache.get(cachekey)
-        if not attr_obj:
-            # no old attr available; create new.
-            attr_obj = Attribute(db_key=key, db_category=category,
-                                 db_model=self._model, db_attrtype=self._attrtype)
-            attr_obj.save()  # important
-            getattr(self.obj, self._m2m_fieldname).add(attr_obj)
-            self._cache[cachekey] = attr_obj
-        if lockstring:
-            attr_obj.locks.add(lockstring)
-        # we shouldn't need to fear stale objects, the field signalling
-        # should catch all cases
-        if strattr:
-            # store as a simple string
-            attr_obj.db_strvalue = value
-            attr_obj.save(update_fields=["db_strvalue"])
+
+        if attr_obj:
+            # update an existing attribute object
+            if strattr:
+                # store as a simple string (will not notify OOB handlers)
+                attr_obj.db_strvalue = value
+                attr_obj.save(update_fields=["db_strvalue"])
+            else:
+                # store normally (this will also notify OOB handlers)
+                attr_obj.value = value
         else:
-            # pickle arbitrary data
-            attr_obj.value = value
+            # create a new Attribute (no OOB handlers can be notified)
+            kwargs = {"db_key" : keystr, "db_category" : category,
+                      "db_model" : self._model, "db_attrtype" : self._attrtype,
+                      "db_value" : None if strattr else to_pickle(value),
+                      "db_strvalue" : value if strattr else None}
+            new_attr = Attribute(**kwargs)
+            new_attr.save()
+            getattr(self.obj, self._m2m_fieldname).add(new_attr)
+            self._cache[cachekey] = new_attr
+
+
+    def batch_add(self, key, value, category=None, lockstring="",
+            strattr=False, accessing_obj=None, default_access=True):
+        """
+        Batch-version of add(). This is more efficient than
+        repeat-calling add.
+
+        key and value must be sequences of the same length, each
+        representing a key-value pair.
+
+        """
+        if accessing_obj and not self.obj.access(accessing_obj,
+                                      self._attrcreate, default=default_access):
+            # check create access
+            return
+        if self._cache is None:
+            self._recache()
+        if not key:
+            return
+
+        keys, values= make_iter(key), make_iter(value)
+
+        if len(keys) != len(values):
+            raise RuntimeError("AttributeHandler.add(): key and value of different length: %s vs %s" % key, value)
+        category = category.strip().lower() if category is not None else None
+        new_attrobjs = []
+        for ikey, keystr in enumerate(keys):
+            keystr = keystr.strip().lower()
+            new_value = values[ikey]
+            cachekey = "%s-%s" % (keystr, category)
+            attr_obj = self._cache.get(cachekey)
+
+            if attr_obj:
+                # update an existing attribute object
+                if strattr:
+                    # store as a simple string (will not notify OOB handlers)
+                    attr_obj.db_strvalue = new_value
+                    attr_obj.save(update_fields=["db_strvalue"])
+                else:
+                    # store normally (this will also notify OOB handlers)
+                    attr_obj.value = new_value
+            else:
+                # create a new Attribute (no OOB handlers can be notified)
+                kwargs = {"db_key" : keystr, "db_category" : category,
+                          "db_model" : self._model, "db_attrtype" : self._attrtype,
+                          "db_value" : None if strattr else to_pickle(new_value),
+                          "db_strvalue" : value if strattr else None}
+                new_attr = Attribute(**kwargs)
+                new_attr.save()
+                new_attrobjs.append(new_attr)
+        if new_attrobjs:
+            # Add new objects to m2m field all at once
+            getattr(self.obj, self._m2m_fieldname).add(*new_attrobjs)
+            self._recache()
+
 
     def remove(self, key, raise_exception=False, category=None,
                accessing_obj=None, default_access=True):
@@ -415,6 +475,7 @@ class AttributeHandler(object):
                     if attr.access(accessing_obj, self._attredit, default=default_access)]
         else:
             return self._cache.values()
+
 
 class NickHandler(AttributeHandler):
     """
@@ -539,8 +600,8 @@ class Tag(models.Model):
     class Meta:
         "Define Django meta options"
         verbose_name = "Tag"
-        unique_together = (('db_key', 'db_category'),)
-        index_together = (('db_key', 'db_category'),)
+        unique_together = (('db_key', 'db_category', 'db_tagtype'),)
+        index_together = (('db_key', 'db_category', 'db_tagtype'),)
 
     def __unicode__(self):
         return u"%s" % self.db_key
@@ -581,8 +642,10 @@ class TagHandler(object):
                                self.obj, self._m2m_fieldname).filter(
                                    db_model=self._model).filter(tagtype))
 
-    def add(self, tag, category=None, data=None):
+    def add(self, tag=None, category=None, data=None):
         "Add a new tag to the handler. Tag is a string or a list of strings."
+        if not tag:
+            return
         for tagstr in make_iter(tag):
             if not tagstr:
                 continue
